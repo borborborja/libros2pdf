@@ -5,7 +5,7 @@ Modo interactivo con menús, progreso en vivo y control de procesos.
 Se lanza con:  python3 -m libros2pdf tui
 """
 
-import sys, os, time, threading, queue, asyncio, json
+import sys, os, time, threading, queue, asyncio, json, unicodedata, re
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +30,12 @@ from libros2pdf import (
     DEFAULT_DPI, DEFAULT_VISION_PROMPT, ENGINE_DEFAULTS, natural_sort_key,
     ocr_pdf_dir,
 )
+from libros2pdf.i18n import t, set_lang, get_lang, SUPPORTED, LANG_LABELS
+
+def _safe_widget_id(name: str) -> str:
+    """Convierte un nombre de libro en un ID válido para Textual (solo ASCII, letras/números/guiones/guiones bajos)."""
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", normalized)
 
 # ── Config persistente ───────────────────────────────────────────────────────────
 
@@ -45,7 +51,10 @@ def _load_tui_config() -> dict:
             cfg = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         pass
-    # El prompt se lee de prompt.txt (tiene prioridad sobre el campo json legado)
+    # Aplicar idioma guardado
+    if cfg.get("ui_lang") in SUPPORTED:
+        set_lang(cfg["ui_lang"])
+    # El prompt se lee de prompt.txt
     try:
         if _PROMPT_PATH.exists():
             cfg["ocr_prompt"] = _PROMPT_PATH.read_text(encoding="utf-8")
@@ -66,6 +75,10 @@ def _save_tui_config(cfg: dict) -> None:
             _PROMPT_PATH.write_text(prompt, encoding="utf-8")
     except Exception:
         pass
+
+
+# Cargar idioma guardado al importar el módulo (para BINDINGS y widgets)
+_load_tui_config()
 
 
 # ── Modelos conocidos por motor ──────────────────────────────────────────────────
@@ -107,15 +120,22 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Container(
-            Static("\n📄 [bold]libros2pdf[/bold] — Genera PDFs con OCR\n", id="title"),
-            Static("Elige un modo:", id="subtitle"),
+            Static("\n📄 [bold]libros2pdf[/bold]\n", id="title"),
+            Static(t("app_subtitle"), id="subtitle"),
             ListView(
-                ListItem(Static("🖼️   Imágenes → PDF / PDF+OCR   (procesar imágenes desde cero)", id="opt-process")),
-                ListItem(Static("📄   PDF → PDF+OCR              (añadir OCR a PDFs existentes)", id="opt-pdf-ocr")),
-                ListItem(Static("📊   Ver estado", id="opt-status")),
-                ListItem(Static("🌐   Iniciar API REST", id="opt-serve")),
-                ListItem(Static("❌   Salir", id="opt-exit")),
+                ListItem(Static(t("menu_images"),  id="opt-process")),
+                ListItem(Static(t("menu_pdf_ocr"), id="opt-pdf-ocr")),
+                ListItem(Static(t("menu_status"),  id="opt-status")),
+                ListItem(Static(t("menu_api"),     id="opt-serve")),
+                ListItem(Static(t("menu_exit"),    id="opt-exit")),
                 id="main-menu",
+            ),
+            Horizontal(
+                *[Button(LANG_LABELS[l],
+                         variant="primary" if l == get_lang() else "default",
+                         id=f"lang-{l}")
+                  for l in SUPPORTED],
+                id="lang-row",
             ),
             id="main-container",
         )
@@ -134,6 +154,19 @@ class MainScreen(Screen):
         elif item_id == "opt-exit":
             self.app.exit()
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid.startswith("lang-"):
+            lang = bid[5:]
+            set_lang(lang)
+            # Guardar preferencia
+            cfg = _load_tui_config()
+            cfg["ui_lang"] = lang
+            _save_tui_config(cfg)
+            # Reconstruir pantalla con nuevo idioma
+            self.app.pop_screen()
+            self.app.push_screen(MainScreen())
+
 
 # ── Pantalla de configuración de proceso ────────────────────────────────────────
 
@@ -144,72 +177,68 @@ class ProcessConfigScreen(Screen):
         yield Header(show_clock=True)
         yield ScrollableContainer(
 
-            # ── Siempre visible ────────────────────────────────────────────────
-            Static("[bold]📁 Directorios[/bold]", classes="cfg-section"),
-            Label("Entrada (cada subcarpeta = un PDF):"),
+            Static(t("sec_dirs"), classes="cfg-section"),
+            Label(t("lbl_input_dir")),
             Input(placeholder="/Users/.../bautismos", id="input-dir"),
-            Label("Salida:"),
+            Label(t("lbl_output_dir")),
             Input(placeholder="PDF_LIBROS", value="PDF_LIBROS", id="output-dir"),
 
-            Static("[bold]🤖 Motor OCR[/bold]", classes="cfg-section"),
-            Label("Motor:"),
+            Static(t("sec_engine"), classes="cfg-section"),
+            Label(t("lbl_engine")),
             Select([(e, e) for e in ENGINE_DEFAULTS], value="tesseract", id="engine"),
-            Label("Modelo:"),
-            Select([("(no aplica)", Select.BLANK)], value=Select.BLANK,
+            Label(t("lbl_model")),
+            Select([(t("no_applies"), Select.BLANK)], value=Select.BLANK,
                    id="model", disabled=True),
-            Input(placeholder="o escribe un modelo personalizado (tiene prioridad)",
-                  id="model-custom"),
-            Label("API Key (o variable ANTHROPIC / OPENAI / OPENROUTER_API_KEY):"),
-            Input(placeholder="sk-…  (vacío = usa variable de entorno)",
-                  password=True, id="api-key"),
-            Button("🔌 Probar conexión", variant="default", id="btn-test-connection"),
+            Input(placeholder=t("lbl_model_custom"), id="model-custom"),
+            Label(t("lbl_api_key")),
+            Input(placeholder="sk-…", password=True, id="api-key"),
+            Button(t("btn_test"), variant="default", id="btn-test-connection"),
             Static("", id="test-result"),
 
-            # ── Opciones avanzadas (colapsadas por defecto) ────────────────────
             Collapsible(
-                Label("Base URL (OpenRouter / Ollama — vacío = defecto):"),
+                Label(t("lbl_base_url")),
                 Input(placeholder="https://openrouter.ai/api/v1", id="base-url"),
 
-                Label("Formato de salida:"),
-                Select([("PDF estándar",              "pdf"),
-                        ("PDF/A-2b — archival",       "pdf_a"),
-                        ("Comprimido (WebP→JPEG) — ~50% más pequeño", "compressed")],
+                Label(t("lbl_format")),
+                Select([(t("fmt_pdf"),        "pdf"),
+                        (t("fmt_pdf_a"),      "pdf_a"),
+                        (t("fmt_compressed"), "compressed")],
                        value="pdf", id="pdf-format"),
 
-                Label("Workers (páginas en paralelo — solo visión):"),
-                Select([("1 — secuencial",  "1"),
-                        ("3 — recomendado", "3"),
-                        ("5 — rápido",      "5"),
-                        ("10 — agresivo",   "10"),
-                        ("20 — máximo",     "20")],
+                Label(t("lbl_workers")),
+                Select([(t("worker_1"),  "1"),
+                        (t("worker_3"), "3"),
+                        (t("worker_5"),      "5"),
+                        (t("worker_10"),   "10"),
+                        (t("worker_20"),     "20")],
                        value="3", id="workers"),
 
-                Label("Idioma Tesseract:"),
+                Label(t("lbl_lang_tess")),
                 Select([("spa+lat — español + latín", "spa+lat"),
                         ("spa — solo español",         "spa"),
                         ("spa+lat+equ — con fórmulas", "spa+lat+equ")],
                        value="spa+lat", id="lang"),
 
-                Label("OCR activado (desactivar = PDF sin capa de texto):"),
+                Label(t("lbl_ocr_on")),
                 Switch(value=True, id="ocr-switch"),
 
-                Label("Forzar reprocesado (ignora estado guardado, solo esta vez):"),
+                Label(t("lbl_force")),
                 Switch(value=False, id="force-switch"),
 
-                Label("🗑  Eliminar imágenes originales tras verificar PDF (¡irreversible!):"),
+                Label(t("lbl_delete_orig")),
                 Switch(value=False, id="delete-originals-switch"),
 
-                Label("Prompt para el modelo de visión:"),
+                Static(t("sec_prompt"), classes="cfg-section"),
+                Label(t("lbl_prompt")),
                 TextArea(DEFAULT_VISION_PROMPT, id="ocr-prompt", language=None),
-                Button("↺  Restaurar prompt por defecto", variant="default",
-                       id="btn-reset-prompt"),
+                Button(t("btn_reset_prompt"), variant="default", id="btn-reset-prompt"),
 
-                title="⚙️  Opciones avanzadas",
+                title=t("advanced_opts"),
                 collapsed=True,
             ),
 
-            Button("▶  Iniciar", variant="primary", id="btn-start"),
-            Button("⬅  Volver", variant="default", id="btn-back"),
+            Button(t("btn_start"), variant="primary", id="btn-start"),
+            Button(t("btn_back"),  variant="default", id="btn-back"),
         )
         yield Footer()
 
@@ -226,6 +255,8 @@ class ProcessConfigScreen(Screen):
             self.query_one("#base-url", Input).value = cfg["base_url"]
         if cfg.get("workers"):
             self.query_one("#workers", Select).value = str(cfg["workers"])
+        if cfg.get("pdf_format"):
+            self.query_one("#pdf-format", Select).value = cfg["pdf_format"]
         if cfg.get("lang"):
             self.query_one("#lang", Select).value = cfg["lang"]
         if cfg.get("skip_ocr") is not None:
@@ -260,20 +291,20 @@ class ProcessConfigScreen(Screen):
         models = ENGINE_MODELS.get(engine, [])
 
         if engine == "tesseract":
-            sel.set_options([("(no aplica)", Select.BLANK)])
+            sel.set_options([(t("no_applies"), Select.BLANK)])
             sel.value    = Select.BLANK
             sel.disabled = True
             return
 
         if engine == "ollama":
-            sel.set_options([("⏳ detectando modelos instalados…", Select.BLANK)])
+            sel.set_options([(t("detecting_ollama"), Select.BLANK)])
             sel.value    = Select.BLANK
             sel.disabled = True
             threading.Thread(target=self._fetch_ollama_models, daemon=True).start()
             return
 
         if engine == "openrouter":
-            sel.set_options([("⏳ cargando modelos de OpenRouter…", Select.BLANK)])
+            sel.set_options([(t("loading_openrouter"), Select.BLANK)])
             sel.value    = Select.BLANK
             sel.disabled = True
             threading.Thread(target=self._fetch_openrouter_models,
@@ -294,7 +325,7 @@ class ProcessConfigScreen(Screen):
         if not api_key:
             self.app.call_from_thread(
                 self._apply_vision_models,
-                [("(introduce una API key para ver los modelos disponibles)", Select.BLANK)],
+                [(t("enter_api_key"), Select.BLANK)],
                 saved_model,
             )
             return
@@ -320,9 +351,9 @@ class ProcessConfigScreen(Screen):
 
             opts.sort(key=lambda x: x[0].lower())
             if not opts:
-                opts = [("(ningún modelo de visión disponible)", Select.BLANK)]
+                opts = [(t("no_vision_models"), Select.BLANK)]
         except Exception as e:
-            opts = [(f"(error al cargar modelos: {e})", Select.BLANK)]
+            opts = [(f"{t('error_loading')}: {e})", Select.BLANK)]
 
         self.app.call_from_thread(self._apply_vision_models, opts, saved_model)
 
@@ -346,9 +377,9 @@ class ProcessConfigScreen(Screen):
             with urllib.request.urlopen(f"{base}/api/tags", timeout=3) as r:
                 data = json.loads(r.read())
             names = [m["name"] for m in data.get("models", [])]
-            opts  = [(n, n) for n in names] if names else [("(ningún modelo instalado)", Select.BLANK)]
+            opts  = [(n, n) for n in names] if names else [(t("no_models_installed"), Select.BLANK)]
         except Exception:
-            opts = [("(Ollama no disponible en localhost)", Select.BLANK)]
+            opts = [(t("ollama_unavailable"), Select.BLANK)]
         self.call_from_thread(self._apply_ollama_models, opts)
 
     def _apply_ollama_models(self, opts: list) -> None:
@@ -369,7 +400,7 @@ class ProcessConfigScreen(Screen):
         result_w  = self.query_one("#test-result", Static)
         btn       = self.query_one("#btn-test-connection", Button)
 
-        result_w.update("[yellow]⏳ Probando conexión…[/yellow]")
+        result_w.update(f"[yellow]{t('testing_conn')}[/yellow]")
         btn.disabled = True
 
         def _test():
@@ -378,7 +409,7 @@ class ProcessConfigScreen(Screen):
             self.app.call_from_thread(_show, ok, msg)
 
         def _show(ok: bool, msg: str):
-            icon = "[green]✔[/green]" if ok else "[red]✗[/red]"
+            icon = t("test_ok") if ok else t("test_fail")
             result_w.update(f"{icon} {msg}")
             btn.disabled = False
 
@@ -413,22 +444,17 @@ class ProcessConfigScreen(Screen):
             ocr_prompt       = self.query_one("#ocr-prompt", TextArea).text.strip() or None
 
             if not input_dir:
-                self.app.push_screen(ErrorScreen("El directorio de entrada es obligatorio"))
+                self.app.push_screen(ErrorScreen(t("err_input_req")))
                 return
 
             in_path    = Path(input_dir).resolve()
             output_dir = self.query_one("#output-dir", Input).value.strip() or str(in_path.parent)
             if not in_path.is_dir():
-                self.app.push_screen(ErrorScreen(f"No existe: {in_path}"))
+                self.app.push_screen(ErrorScreen(f"{t('err_not_exists')}: {in_path}"))
                 return
             books = scan_books(in_path)
             if not books:
-                self.app.push_screen(ErrorScreen(
-                    f"No se encontraron imágenes en:\n{in_path}\n\n"
-                    "Acepta:\n"
-                    "• Directorio con subcarpetas de imágenes (1 PDF por subcarpeta)\n"
-                    "• Directorio con imágenes directamente (1 PDF)"
-                ))
+                self.app.push_screen(ErrorScreen(t("err_no_images")))
                 return
 
             _save_tui_config({
@@ -439,6 +465,7 @@ class ProcessConfigScreen(Screen):
                 "api_key":    api_key or "",
                 "base_url":   base_url or "",
                 "workers":    workers,
+                "pdf_format": pdf_format,
                 "lang":       lang,
                 "skip_ocr":   skip_ocr,
                 "ocr_prompt": ocr_prompt or "",
@@ -492,14 +519,14 @@ class ProcessScreen(Screen):
         yield Container(
             Static(id="process-title", classes="section-title"),
             Horizontal(
-                Static("General: ", id="global-label"),
+                Static(t("proc_general"), id="global-label"),
                 ProgressBar(id="global-progress", show_eta=True),
             ),
             ScrollableContainer(id="book-progress-container"),
             Rule(),
             RichLog(id="log-view", highlight=True, markup=True, max_lines=50),
             Horizontal(
-                Button("⬅ Volver al menú", variant="error", id="btn-cancel"),
+                Button(t("btn_back_menu"), variant="error", id="btn-cancel"),
                 id="footer-buttons",
             ),
             id="process-container",
@@ -512,14 +539,14 @@ class ProcessScreen(Screen):
         self._total_pages = sum(len(imgs) for _, imgs in books)
 
         title = self.query_one("#process-title", Static)
-        ocr_status = "[dim]sin OCR[/dim]" if self._skip_ocr else self._engine
-        title.update(f"[bold]📖 {self._input_dir.name}[/bold]  ·  {len(books)} libros  ·  {self._total_pages} páginas  ·  {ocr_status}")
+        ocr_status = t("log_no_ocr") if self._skip_ocr else self._engine
+        title.update(f"[bold]📖 {self._input_dir.name}[/bold]  ·  {len(books)} {t('log_books_of')}  ·  {self._total_pages} {t('log_pages_of')}  ·  {ocr_status}")
 
         # Crear progress bars por libro
         container = self.query_one("#book-progress-container", ScrollableContainer)
         for name, imgs in books:
             short = name[:55]
-            safe_id = name.replace(" ", "_").replace(".", "_")
+            safe_id = _safe_widget_id(name)
             row = Horizontal(
                 Static(f"[cyan]{short}[/cyan]", classes="book-label"),
                 ProgressBar(total=len(imgs), id=f"pb-{safe_id}", show_eta=False),
@@ -531,7 +558,7 @@ class ProcessScreen(Screen):
 
         # Arrancar worker
         log = self.query_one("#log-view", RichLog)
-        log.write("[green]▶ Iniciando procesamiento...[/green]")
+        log.write(f"[green]▶ {t('log_starting')}[/green]")
 
         output_dir = self._output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -582,7 +609,7 @@ class ProcessScreen(Screen):
         except Exception as exc:
             try:
                 self.query_one("#log-view", RichLog).write(
-                    f"[red]   ! error UI: {exc}[/red]"
+                    f"[red]   ! {t('log_ui_error')}: {exc}[/red]"
                 )
             except Exception:
                 pass
@@ -601,48 +628,48 @@ class ProcessScreen(Screen):
             self._try_update_book_pb(bk, page)
 
         elif ev.kind == ProgressEvent.PAGE_FAIL:
-            log.write(f"[yellow]   ⚠ {d.get('file', '')} (fallo)[/yellow]")
+            log.write(f"[yellow]   ⚠ {d.get('file', '')} ({t('log_fail')})[/yellow]")
             gpb.advance(1)
             self._try_update_book_pb(bk, page)
 
         elif ev.kind == ProgressEvent.MERGE_START:
-            log.write(f"[cyan]   ⎇ Mergeando {bk}...[/cyan]")
+            log.write(f"[cyan]   ⎇ {t('log_merging')} {bk}...[/cyan]")
 
         elif ev.kind == ProgressEvent.VERIFY_OK:
-            log.write(f"[green]   ✔ Verificado: {d.get('message', '')}[/green]")
+            log.write(f"[green]   ✔ {t('log_verified')}: {d.get('message', '')}[/green]")
 
         elif ev.kind == ProgressEvent.VERIFY_FAIL:
-            log.write(f"[red]   ✗ Verificación fallida: {d.get('message', '')}[/red]")
+            log.write(f"[red]   ✗ {t('log_verify_fail')}: {d.get('message', '')}[/red]")
 
         elif ev.kind == ProgressEvent.LOG:
             log.write(f"   {d.get('message', '')}")
 
         elif ev.kind == ProgressEvent.BOOK_FAIL:
-            log.write(f"[red]   ✗ {bk}: merge fallido — activa 'Forzar reprocesado' para reintentar[/red]")
+            log.write(f"[red]   ✗ {bk}: {t('log_merge_fail')}[/red]")
 
         elif ev.kind == ProgressEvent.BOOK_DONE:
-            log.write(f"[green]   ✓ {bk}: {d.get('pages',0)}/{d.get('total',0)} págs, {d.get('size_mb',0)} MB[/green]")
+            log.write(f"[green]   ✓ {bk}: {d.get('pages',0)}/{d.get('total',0)} {t('log_pags')}, {d.get('size_mb',0)} MB[/green]")
             title = self.query_one("#process-title", Static)
             done = len([n for n, _ in self._books
                        if n in (load_state(self._output_dir / "estado.json").get("done", []))])
-            title.update(f"[bold]📖 {self._input_dir.name}[/bold]  ·  {done}/{len(self._books)} libros completados")
+            title.update(f"[bold]📖 {self._input_dir.name}[/bold]  ·  {done}/{len(self._books)} {t('log_done_count')}")
 
         elif ev.kind == ProgressEvent.ALL_DONE:
             result = d.get("result", {})
             elapsed = result.get("elapsed", 0)
             completed = result.get("completed", 0)
-            log.write(f"\n[bold green]🎉 ¡Proceso completado! {elapsed}s · {completed} libros[/bold green]")
+            log.write(f"\n[bold green]{t('log_completed')} {elapsed}s · {completed} {t('log_books_of')}[/bold green]")
             if result.get("pdfs"):
                 total_mb = result.get("total_size_mb", 0)
                 log.write(f"[bold]📄 {len(result['pdfs'])} PDFs · {total_mb} MB[/bold]")
                 for p in result["pdfs"]:
                     log.write(f"   {p['name']}  {p['size_mb']} MB")
-            self.query_one("#btn-cancel", Button).label = "⬅ Volver"
+            self.query_one("#btn-cancel", Button).label = t("back_done")
 
     def _try_update_book_pb(self, book_name: str, page: Optional[int]):
         if page is None:
             return
-        safe_id = book_name.replace(" ", "_").replace(".", "_")
+        safe_id = _safe_widget_id(book_name)
         try:
             pb = self.query_one(f"#pb-{safe_id}", ProgressBar)
             pb.update(progress=page + 1)
@@ -658,8 +685,8 @@ class ProcessScreen(Screen):
             self._cancel_event.set()
             self._event_consumer_running = False
             log = self.query_one("#log-view", RichLog)
-            log.write("[yellow]⚠ Proceso cancelado[/yellow]")
-            self.query_one("#btn-cancel", Button).label = "⬅ Volver"
+            log.write(t("log_cancelled"))
+            self.query_one("#btn-cancel", Button).label = t("btn_back")
             # Esperar un momento y volver
             self.app.pop_screen()
 
@@ -672,51 +699,51 @@ class PdfOcrConfigScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield ScrollableContainer(
-            Static("[bold]📄 PDF → PDF+OCR[/bold]", classes="cfg-section"),
-            Label("PDF de entrada o directorio con PDFs:"),
+            Static(t("pdf_ocr_title"), classes="cfg-section"),
+            Label(t("lbl_pdf_input")),
             Input(placeholder="/ruta/a/libro.pdf  o  /ruta/a/directorio/", id="pdf-input"),
-            Label("Directorio de salida (PDFs con OCR):"),
+            Label(t("lbl_pdf_output")),
             Input(placeholder="PDFs_OCR", value="PDFs_OCR", id="pdf-output"),
 
-            Static("[bold]🤖 Motor OCR[/bold]", classes="cfg-section"),
-            Label("Motor:"),
+            Static(t("sec_engine"), classes="cfg-section"),
+            Label(t("lbl_engine")),
             Select([(e, e) for e in ENGINE_DEFAULTS], value="openrouter", id="pdf-engine"),
-            Label("Modelo:"),
-            Select([("(no aplica)", Select.BLANK)], value=Select.BLANK,
+            Label(t("lbl_model")),
+            Select([(t("no_applies"), Select.BLANK)], value=Select.BLANK,
                    id="pdf-model", disabled=True),
-            Input(placeholder="modelo personalizado", id="pdf-model-custom"),
-            Label("API Key:"),
+            Input(placeholder=t("lbl_model_custom"), id="pdf-model-custom"),
+            Label(t("lbl_api_key")),
             Input(placeholder="sk-…", password=True, id="pdf-api-key"),
-            Button("🔌 Probar conexión", variant="default", id="pdf-btn-test"),
+            Button(t("btn_test"), variant="default", id="pdf-btn-test"),
             Static("", id="pdf-test-result"),
 
             Collapsible(
-                Label("Base URL (OpenRouter / Ollama):"),
+                Label(t("lbl_base_url")),
                 Input(placeholder="https://openrouter.ai/api/v1", id="pdf-base-url"),
 
-                Label("Formato de salida:"),
-                Select([("PDF estándar",                              "pdf"),
-                        ("PDF/A-2b — archival",                      "pdf_a"),
-                        ("Comprimido (WebP→JPEG) — ~50% más pequeño","compressed")],
+                Label(t("lbl_format")),
+                Select([(t("fmt_pdf"),        "pdf"),
+                        (t("fmt_pdf_a"),      "pdf_a"),
+                        (t("fmt_compressed"), "compressed")],
                        value="pdf", id="pdf-format"),
 
-                Label("Workers (páginas en paralelo):"),
-                Select([("1 — secuencial",  "1"),
-                        ("3 — recomendado", "3"),
-                        ("5 — rápido",      "5"),
-                        ("10 — agresivo",   "10")],
+                Label(t("lbl_workers")),
+                Select([(t("worker_1"),  "1"),
+                        (t("worker_3"), "3"),
+                        (t("worker_5"),      "5"),
+                        (t("worker_10"),   "10")],
                        value="3", id="pdf-workers"),
 
-                Label("Prompt OCR:"),
+                Label(t("lbl_prompt")),
                 TextArea(DEFAULT_VISION_PROMPT, id="pdf-prompt", language=None),
-                Button("↺ Restaurar prompt", variant="default", id="pdf-btn-reset-prompt"),
+                Button(t("btn_reset_prompt"), variant="default", id="pdf-btn-reset-prompt"),
 
-                title="⚙️  Opciones avanzadas",
+                title=t("advanced_opts"),
                 collapsed=True,
             ),
 
-            Button("▶  Iniciar", variant="primary", id="pdf-btn-start"),
-            Button("⬅  Volver",  variant="default", id="pdf-btn-back"),
+            Button(t("btn_start"), variant="primary", id="pdf-btn-start"),
+            Button(t("btn_back"),  variant="default", id="pdf-btn-back"),
         )
         yield Footer()
 
@@ -726,6 +753,10 @@ class PdfOcrConfigScreen(Screen):
             self.query_one("#pdf-api-key", Input).value = cfg["api_key"]
         if cfg.get("base_url"):
             self.query_one("#pdf-base-url", Input).value = cfg["base_url"]
+        if cfg.get("pdf_format"):
+            self.query_one("#pdf-format", Select).value = cfg["pdf_format"]
+        if cfg.get("pdf_workers"):
+            self.query_one("#pdf-workers", Select).value = str(cfg["pdf_workers"])
         if cfg.get("ocr_prompt"):
             self.query_one("#pdf-prompt", TextArea).load_text(cfg["ocr_prompt"])
         engine = cfg.get("engine", "openrouter")
@@ -740,9 +771,9 @@ class PdfOcrConfigScreen(Screen):
         sel    = self.query_one("#pdf-model", Select)
         models = ENGINE_MODELS.get(engine, [])
         if engine == "tesseract":
-            sel.set_options([("(no aplica)", Select.BLANK)]); sel.value = Select.BLANK; sel.disabled = True; return
+            sel.set_options([(t("no_applies"), Select.BLANK)]); sel.value = Select.BLANK; sel.disabled = True; return
         if engine == "ollama":
-            sel.set_options([("⏳ detectando…", Select.BLANK)]); sel.value = Select.BLANK; sel.disabled = True
+            sel.set_options([(t("detecting_ollama"), Select.BLANK)]); sel.value = Select.BLANK; sel.disabled = True
             threading.Thread(target=self._fetch_ollama, daemon=True).start(); return
         sel.set_options(models); sel.disabled = False
         vals = [v for _, v in models]
@@ -755,9 +786,9 @@ class PdfOcrConfigScreen(Screen):
         try:
             with urllib.request.urlopen(f"{base.replace('/v1','')}/api/tags", timeout=3) as r:
                 data = json.loads(r.read())
-            opts = [(m["name"], m["name"]) for m in data.get("models", [])] or [("(ninguno)", Select.BLANK)]
+            opts = [(m["name"], m["name"]) for m in data.get("models", [])] or [(t("no_models_installed"), Select.BLANK)]
         except Exception:
-            opts = [("(Ollama no disponible)", Select.BLANK)]
+            opts = [(t("ollama_unavailable"), Select.BLANK)]
         def apply():
             sel = self.query_one("#pdf-model", Select)
             sel.set_options(opts); sel.disabled = (opts[0][1] == Select.BLANK)
@@ -783,10 +814,10 @@ class PdfOcrConfigScreen(Screen):
         base_url= self.query_one("#pdf-base-url", Input).value.strip() or None
         res_w   = self.query_one("#pdf-test-result", Static)
         btn     = self.query_one("#pdf-btn-test", Button)
-        res_w.update("[yellow]⏳ Probando…[/yellow]"); btn.disabled = True
+        res_w.update(f"[yellow]{t('testing')}[/yellow]"); btn.disabled = True
         def _t():
             ok, msg = test_backend(engine, model=model, api_key=api_key, base_url=base_url)
-            self.app.call_from_thread(lambda: (res_w.update(f"{'[green]✔[/green]' if ok else '[red]✗[/red]'} {msg}"), setattr(btn, 'disabled', False)))
+            self.app.call_from_thread(lambda: (res_w.update(f"{t('test_ok') if ok else t('test_fail')} {msg}"), setattr(btn, 'disabled', False)))
         threading.Thread(target=_t, daemon=True).start()
 
     def _start(self) -> None:
@@ -795,7 +826,7 @@ class PdfOcrConfigScreen(Screen):
         raw = _re.sub(r'\\(.)', r'\1', raw)
         in_path = Path(raw).resolve()
         if not in_path.exists():
-            self.app.push_screen(ErrorScreen(f"No existe: {in_path}")); return
+            self.app.push_screen(ErrorScreen(f"{t('err_not_exists')}: {in_path}")); return
 
         out_val = self.query_one("#pdf-output", Input).value.strip() or "PDFs_OCR"
         out_dir = (in_path.parent / out_val) if not Path(out_val).is_absolute() else Path(out_val)
@@ -816,6 +847,16 @@ class PdfOcrConfigScreen(Screen):
         else:
             glob_pat = "*.pdf"
             scan_dir = in_path
+
+        _save_tui_config({
+            "engine":      engine,
+            "model":       model or "",
+            "api_key":     api_key or "",
+            "base_url":    base_url or "",
+            "pdf_format":  fmt,
+            "pdf_workers": workers,
+            "ocr_prompt":  prompt or "",
+        })
 
         self.app.push_screen(PdfOcrProcessScreen(
             scan_dir, out_dir, glob_pat,
@@ -852,12 +893,12 @@ class PdfOcrProcessScreen(Screen):
         yield Container(
             Static(id="pdf-proc-title", classes="section-title"),
             Horizontal(
-                Static("General: ", id="global-label"),
+                Static(t("proc_general"), id="global-label"),
                 ProgressBar(id="global-progress", show_eta=True),
             ),
             Rule(),
             RichLog(id="log-view", highlight=True, markup=True, max_lines=200),
-            Button("⬅ Volver al menú", variant="error", id="btn-cancel"),
+            Button(t("btn_back_menu"), variant="error", id="btn-cancel"),
             id="process-container",
         )
         yield Footer()
@@ -865,11 +906,11 @@ class PdfOcrProcessScreen(Screen):
     def on_mount(self) -> None:
         pdfs = sorted(self._input_dir.glob(self._glob))
         n    = len(pdfs)
-        fmt_label = {"pdf": "PDF", "pdf_a": "PDF/A", "compressed": "Comprimido"}.get(self._pdf_format, "PDF")
+        fmt_label = {"pdf": t("fmt_short_pdf"), "pdf_a": t("fmt_short_pdf_a"), "compressed": t("fmt_short_compressed")}.get(self._pdf_format, t("fmt_short_pdf"))
         self.query_one("#pdf-proc-title", Static).update(
             f"[bold]📄 {self._input_dir.name}[/bold]  ·  {n} PDFs  ·  {self._engine}  ·  {fmt_label}")
         self.query_one("#global-progress", ProgressBar).update(total=max(n, 1), progress=0)
-        self.query_one("#log-view", RichLog).write("[green]▶ Iniciando…[/green]")
+        self.query_one("#log-view", RichLog).write(f"[green]{t('pdf_proc_start')}[/green]")
 
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -906,9 +947,9 @@ class PdfOcrProcessScreen(Screen):
             elif ev.kind == ProgressEvent.PAGE_OK:
                 log.write(f"   ✓ {d.get('file','')}")
             elif ev.kind == ProgressEvent.PAGE_FAIL:
-                log.write(f"[yellow]   ⚠ {d.get('file','')} (fallo)[/yellow]")
+                log.write(f"[yellow]   ⚠ {d.get('file','')} ({t('log_fail')})[/yellow]")
             elif ev.kind == ProgressEvent.MERGE_START:
-                log.write(f"[cyan]   ⎇ Reconstruyendo PDF…[/cyan]")
+                log.write(f"[cyan]   ⎇ {t('log_rebuilding')}[/cyan]")
             elif ev.kind == ProgressEvent.VERIFY_OK:
                 log.write(f"[green]   ✔ {d.get('message','')}[/green]")
             elif ev.kind == ProgressEvent.VERIFY_FAIL:
@@ -918,11 +959,11 @@ class PdfOcrProcessScreen(Screen):
                 log.write(f"[green]   ✓ {d.get('book','')} — {d.get('size_mb',0)} MB[/green]")
             elif ev.kind == ProgressEvent.BOOK_FAIL:
                 gpb.advance(1)
-                log.write(f"[red]   ✗ {d.get('book','')} — fallo[/red]")
+                log.write(f"[red]   ✗ {d.get('book','')} — {t('log_fail')}[/red]")
             elif ev.kind == ProgressEvent.ALL_DONE:
                 r = d.get("result", {})
-                log.write(f"\n[bold green]🎉 Completado — {r.get('ok',0)}/{r.get('total',0)} PDFs con OCR[/bold green]")
-                self.query_one("#btn-cancel", Button).label = "⬅ Volver"
+                log.write(f"\n[bold green]{t('log_completed')} — {r.get('ok',0)}/{r.get('total',0)} {t('pdf_done_fmt')}[/bold green]")
+                self.query_one("#btn-cancel", Button).label = t("btn_back")
         except Exception:
             pass
 
@@ -944,14 +985,14 @@ class StatusScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield ScrollableContainer(
-            Static("\n[bold]📊 Estado de procesamiento[/bold]\n"),
-            Static("Directorio de salida:"),
+            Static(t("status_title")),
+            Static(t("status_outdir_lbl")),
             Input(placeholder="PDF_LIBROS", value="PDF_LIBROS", id="status-outdir"),
-            Static("\nDirectorio de entrada (opcional, para ver pendientes):"),
+            Static(t("status_indir_lbl")),
             Input(placeholder="Ej: /Users/.../bautismos", id="status-indir"),
             Horizontal(
-                Button("🔄 Actualizar", variant="primary", id="btn-refresh"),
-                Button("⬅ Volver", id="btn-back"),
+                Button(t("btn_refresh"), variant="primary", id="btn-refresh"),
+                Button(t("btn_back"), id="btn-back"),
             ),
             DataTable(id="status-table"),
             Static(id="status-summary"),
@@ -967,9 +1008,9 @@ class StatusScreen(Screen):
 
         table = self.query_one("#status-table", DataTable)
         table.clear(columns=True)
-        table.add_column("Libro")
-        table.add_column("Páginas", width=8)
-        table.add_column("Estado", width=14)
+        table.add_column(t("col_book"))
+        table.add_column(t("col_pages"), width=8)
+        table.add_column(t("col_status"), width=14)
 
         estado_path = out_dir / "estado.json" if out_dir.is_dir() else None
         state = load_state(estado_path) if estado_path and estado_path.exists() else {}
@@ -982,12 +1023,12 @@ class StatusScreen(Screen):
                 books = scan_books(in_path)
                 for name, imgs in books:
                     if name in done:
-                        status = "[green]✅ completo[/green]"
+                        status = t("st_done")
                     elif name in progress:
                         p = progress[name]
                         status = f"[yellow]⏳ {p}/{len(imgs)}[/yellow]"
                     else:
-                        status = "[white]⏸ pendiente[/white]"
+                        status = t("st_pending")
                     table.add_row(name[:50], str(len(imgs)), status)
 
         # PDFs generados
@@ -1013,15 +1054,15 @@ class ServeScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Container(
-            Static("\n[bold]🌐 API REST[/bold]\n", classes="section-title"),
-            Static("El servidor API permite conectar una web u otros clientes.\n"),
-            Static("Host:"),
+            Static(t("serve_title"), classes="section-title"),
+            Static(t("serve_desc") + "\n"),
+            Static(t("serve_host")),
             Input(placeholder="127.0.0.1", value="127.0.0.1", id="serve-host"),
-            Static("\nPuerto:"),
+            Static(f"\n{t('serve_port')}"),
             Input(placeholder="8000", value="8000", id="serve-port"),
             Horizontal(
-                Button("▶  Iniciar servidor", variant="primary", id="btn-serve-start"),
-                Button("⬅ Volver", id="btn-back"),
+                Button(t("btn_serve_start"), variant="primary", id="btn-serve-start"),
+                Button(t("btn_back"), id="btn-back"),
             ),
             RichLog(id="serve-log", highlight=True, max_lines=30),
             id="serve-container",
@@ -1035,12 +1076,10 @@ class ServeScreen(Screen):
             host = self.query_one("#serve-host", Input).value.strip() or "127.0.0.1"
             port = int(self.query_one("#serve-port", Input).value.strip() or "8000")
             log = self.query_one("#serve-log", RichLog)
-            log.write(f"[green]▶ Iniciando API en http://{host}:{port}[/green]")
-            log.write(f"[green]   Swagger: http://{host}:{port}/docs[/green]")
-            log.write("[yellow]   (el servidor se ejecuta en la terminal donde lanzaste el TUI)[/yellow]")
-            log.write("[yellow]   Vuelve al menú y selecciona 'Salir' para detener el TUI[/yellow]")
-            log.write("")
-            log.write("[dim]Para iniciar el API en otra terminal:[/dim]")
+            log.write(f"[green]{t('serve_log_start')} http://{host}:{port}[/green]")
+            log.write(f"[green]{t('serve_log_swagger')} http://{host}:{port}/docs[/green]")
+            log.write(f"[yellow]   {t('serve_log_warn')}[/yellow]")
+            log.write(f"[dim]{t('serve_hint')}:[/dim]")
             log.write(f"[dim]  python3 -m libros2pdf serve --host {host} --port {port}[/dim]")
 
             # Arrancar uvicorn en hilo separado
@@ -1054,7 +1093,7 @@ class ServeScreen(Screen):
             )
             t.start()
             self.query_one("#btn-serve-start", Button).disabled = True
-            self.query_one("#btn-serve-start", Button).label = "✅ Servidor activo"
+            self.query_one("#btn-serve-start", Button).label = t("serve_active")
 
 
 # ── Pantalla de error ───────────────────────────────────────────────────────────
@@ -1069,7 +1108,7 @@ class ErrorScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         yield Container(
             Static(f"\n[red]❌ {self._error_msg}[/red]\n"),
-            Button("OK", variant="primary", id="btn-ok"),
+            Button(t("btn_ok"), variant="primary", id="btn-ok"),
             id="error-container",
         )
 
@@ -1216,8 +1255,8 @@ class Libros2PDFApp(App):
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Salir"),
-        Binding("escape", "back", "Volver"),
+        Binding("q", "quit", t("quit_binding")),
+        Binding("escape", "back", t("back_binding")),
     ]
 
     def action_back(self):
