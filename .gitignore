@@ -1,0 +1,28 @@
+# Config — settings contiene rutas personales y API keys
+config/settings.json
+
+# PDFs generados y temporales
+PDF_LIBROS/
+test_output/
+_tmp/
+*.pdf
+
+# Imágenes de prueba
+TEST/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE / Claude
+.claude/
+*.log
+libros_run.py
