@@ -14,7 +14,7 @@ from typing import Optional
 
 from libros2pdf import (
     __version__, scan_books, load_state, save_state, process_all, ProgressEvent,
-    DEFAULT_DPI, ENGINE_DEFAULTS,
+    DEFAULT_DPI, ENGINE_DEFAULTS, ocr_pdf, ocr_pdf_dir,
 )
 
 
@@ -85,6 +85,23 @@ Documentación: python3 -m libros2pdf <comando> --help
     p_proc.add_argument("--no-rich", action="store_true",
                         help="Desactivar barras de progreso (útil para piping)")
 
+    # ── Comando: ocr-pdf ──
+    p_ocr = sub.add_parser("ocr-pdf", help="Añadir capa OCR a PDFs ya existentes")
+    p_ocr.add_argument("input",  type=str, help="PDF o directorio de PDFs")
+    p_ocr.add_argument("output", type=str, nargs="?", default=None,
+                       help="Directorio de salida (defecto: <input>_OCR)")
+    p_ocr.add_argument("--engine", type=str, default="openrouter",
+                       choices=list(ENGINE_DEFAULTS.keys()))
+    p_ocr.add_argument("--model",    type=str, default=None)
+    p_ocr.add_argument("--api-key",  type=str, default=None)
+    p_ocr.add_argument("--base-url", type=str, default=None)
+    p_ocr.add_argument("--prompt",   type=str, default=None)
+    p_ocr.add_argument("--format",   type=str, default="pdf",
+                       choices=["pdf", "pdf_a", "compressed"],
+                       help="Formato de salida: pdf, pdf_a, compressed")
+    p_ocr.add_argument("--workers",  type=int, default=3)
+    p_ocr.add_argument("--dpi",      type=int, default=DEFAULT_DPI)
+
     # ── Comando: tui ──
     p_tui = sub.add_parser("tui", help="Interfaz interactiva de terminal (TUI)")
 
@@ -104,6 +121,9 @@ Documentación: python3 -m libros2pdf <comando> --help
 
     if args.command == "serve":
         return run_api(args.host, args.port)
+
+    if args.command == "ocr-pdf":
+        return run_ocr_pdf(args)
 
     if args.command == "status":
         return show_status(Path(args.output_dir), Path(args.input_dir) if args.input_dir else None)
@@ -357,6 +377,55 @@ def show_status(output_dir: Path, input_dir: Optional[Path] = None):
 
 
 # ── API ──────────────────────────────────────────────────────────────────────────
+
+def run_ocr_pdf(args) -> None:
+    """Añade capa OCR a un PDF o directorio de PDFs existentes."""
+    in_path = Path(args.input).resolve()
+    if not in_path.exists():
+        print(f"❌ No existe: {in_path}"); return
+
+    if args.output:
+        out_dir = Path(args.output).resolve()
+    elif in_path.is_file():
+        out_dir = in_path.parent / (in_path.stem + "_OCR")
+    else:
+        out_dir = in_path.parent / (in_path.name + "_OCR")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    eq = queue.Queue()
+    cancel = threading.Event()
+
+    kw = dict(engine=args.engine, model=args.model, api_key=args.api_key,
+              base_url=args.base_url, ocr_prompt=args.prompt,
+              pdf_format=args.format, workers=args.workers,
+              target_dpi=args.dpi, event_queue=eq, cancel_event=cancel)
+
+    if in_path.is_file():
+        out_path = out_dir / in_path.name
+        print(f"📄 {in_path.name} → {out_path}")
+        worker = threading.Thread(target=ocr_pdf, args=(in_path, out_path), kwargs=kw, daemon=True)
+    else:
+        print(f"📂 {in_path} → {out_dir}")
+        worker = threading.Thread(target=ocr_pdf_dir, args=(in_path, out_dir), kwargs=kw, daemon=True)
+
+    worker.start()
+    while worker.is_alive():
+        try:
+            ev = eq.get(timeout=0.5)
+            d  = ev.to_dict()
+            if ev.kind == ProgressEvent.PAGE_OK:
+                print(f"   ✓ {d.get('file','')}", flush=True)
+            elif ev.kind == ProgressEvent.PAGE_FAIL:
+                print(f"   ⚠ {d.get('file','')} (fallo)", flush=True)
+            elif ev.kind == ProgressEvent.BOOK_DONE:
+                print(f"   ✓ {d.get('book','')} — {d.get('size_mb',0)} MB", flush=True)
+            elif ev.kind == ProgressEvent.ALL_DONE:
+                r = d.get("result", {})
+                print(f"\n🎉 {r.get('ok',0)}/{r.get('total',0)} PDFs procesados")
+        except queue.Empty:
+            continue
+    worker.join()
+
 
 def run_api(host: str, port: int):
     """Arranca el servidor API FastAPI."""

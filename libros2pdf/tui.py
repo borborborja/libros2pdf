@@ -28,6 +28,7 @@ except ImportError:
 from libros2pdf import (
     scan_books, process_all, load_state, test_backend, ProgressEvent,
     DEFAULT_DPI, DEFAULT_VISION_PROMPT, ENGINE_DEFAULTS, natural_sort_key,
+    ocr_pdf_dir,
 )
 
 # ── Config persistente ───────────────────────────────────────────────────────────
@@ -109,10 +110,11 @@ class MainScreen(Screen):
             Static("\n📄 [bold]libros2pdf[/bold] — Genera PDFs con OCR\n", id="title"),
             Static("Elige un modo:", id="subtitle"),
             ListView(
-                ListItem(Static("🚀  Procesar todo el directorio → PDFs (1 por subcarpeta)", id="opt-process")),
-                ListItem(Static("🌐  Iniciar API REST", id="opt-serve")),
-                ListItem(Static("📊  Ver estado", id="opt-status")),
-                ListItem(Static("❌  Salir", id="opt-exit")),
+                ListItem(Static("🖼️   Imágenes → PDF / PDF+OCR   (procesar imágenes desde cero)", id="opt-process")),
+                ListItem(Static("📄   PDF → PDF+OCR              (añadir OCR a PDFs existentes)", id="opt-pdf-ocr")),
+                ListItem(Static("📊   Ver estado", id="opt-status")),
+                ListItem(Static("🌐   Iniciar API REST", id="opt-serve")),
+                ListItem(Static("❌   Salir", id="opt-exit")),
                 id="main-menu",
             ),
             id="main-container",
@@ -123,6 +125,8 @@ class MainScreen(Screen):
         item_id = event.item.children[0].id
         if item_id == "opt-process":
             self.app.push_screen(ProcessConfigScreen())
+        elif item_id == "opt-pdf-ocr":
+            self.app.push_screen(PdfOcrConfigScreen())
         elif item_id == "opt-serve":
             self.app.push_screen(ServeScreen())
         elif item_id == "opt-status":
@@ -165,6 +169,12 @@ class ProcessConfigScreen(Screen):
             Collapsible(
                 Label("Base URL (OpenRouter / Ollama — vacío = defecto):"),
                 Input(placeholder="https://openrouter.ai/api/v1", id="base-url"),
+
+                Label("Formato de salida:"),
+                Select([("PDF estándar",              "pdf"),
+                        ("PDF/A-2b — archival",       "pdf_a"),
+                        ("Comprimido (WebP→JPEG) — ~50% más pequeño", "compressed")],
+                       value="pdf", id="pdf-format"),
 
                 Label("Workers (páginas en paralelo — solo visión):"),
                 Select([("1 — secuencial",  "1"),
@@ -394,6 +404,7 @@ class ProcessConfigScreen(Screen):
             api_key   = self.query_one("#api-key", Input).value.strip() or None
             base_url  = self.query_one("#base-url", Input).value.strip() or None
             workers    = int(str(self.query_one("#workers", Select).value))
+            pdf_format = str(self.query_one("#pdf-format", Select).value)
             lang       = str(self.query_one("#lang", Select).value)
             psm        = 6
             skip_ocr   = not self.query_one("#ocr-switch", Switch).value
@@ -438,7 +449,7 @@ class ProcessConfigScreen(Screen):
                 in_path, Path(output_dir), lang, psm, skip_ocr,
                 engine=engine, model=model, api_key=api_key, base_url=base_url,
                 force=force, workers=workers, ocr_prompt=ocr_prompt,
-                delete_originals=delete_originals,
+                delete_originals=delete_originals, pdf_format=pdf_format,
             ))
 
 
@@ -453,7 +464,8 @@ class ProcessScreen(Screen):
                  api_key: Optional[str] = None, base_url: Optional[str] = None,
                  force: bool = False, workers: int = 5,
                  ocr_prompt: Optional[str] = None,
-                 delete_originals: bool = False, **kwargs):
+                 delete_originals: bool = False,
+                 pdf_format: str = "pdf", **kwargs):
         super().__init__(**kwargs)
         self._input_dir        = input_dir
         self._output_dir       = output_dir
@@ -468,6 +480,7 @@ class ProcessScreen(Screen):
         self._workers          = workers
         self._ocr_prompt       = ocr_prompt
         self._delete_originals = delete_originals
+        self._pdf_format       = pdf_format
         self._event_queue: queue.Queue = queue.Queue()
         self._cancel_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
@@ -547,6 +560,7 @@ class ProcessScreen(Screen):
             lang=self._lang, psm=self._psm,
             skip_ocr=self._skip_ocr, force=self._force,
             workers=self._workers, delete_originals=self._delete_originals,
+            pdf_format=self._pdf_format,
             engine=self._engine, model=self._model,
             api_key=self._api_key, base_url=self._base_url,
             ocr_prompt=self._ocr_prompt,
@@ -648,6 +662,278 @@ class ProcessScreen(Screen):
             self.query_one("#btn-cancel", Button).label = "⬅ Volver"
             # Esperar un momento y volver
             self.app.pop_screen()
+
+
+# ── PDF → PDF+OCR ───────────────────────────────────────────────────────────────
+
+class PdfOcrConfigScreen(Screen):
+    """Configuración para añadir OCR a PDFs ya existentes."""
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield ScrollableContainer(
+            Static("[bold]📄 PDF → PDF+OCR[/bold]", classes="cfg-section"),
+            Label("PDF de entrada o directorio con PDFs:"),
+            Input(placeholder="/ruta/a/libro.pdf  o  /ruta/a/directorio/", id="pdf-input"),
+            Label("Directorio de salida (PDFs con OCR):"),
+            Input(placeholder="PDFs_OCR", value="PDFs_OCR", id="pdf-output"),
+
+            Static("[bold]🤖 Motor OCR[/bold]", classes="cfg-section"),
+            Label("Motor:"),
+            Select([(e, e) for e in ENGINE_DEFAULTS], value="openrouter", id="pdf-engine"),
+            Label("Modelo:"),
+            Select([("(no aplica)", Select.BLANK)], value=Select.BLANK,
+                   id="pdf-model", disabled=True),
+            Input(placeholder="modelo personalizado", id="pdf-model-custom"),
+            Label("API Key:"),
+            Input(placeholder="sk-…", password=True, id="pdf-api-key"),
+            Button("🔌 Probar conexión", variant="default", id="pdf-btn-test"),
+            Static("", id="pdf-test-result"),
+
+            Collapsible(
+                Label("Base URL (OpenRouter / Ollama):"),
+                Input(placeholder="https://openrouter.ai/api/v1", id="pdf-base-url"),
+
+                Label("Formato de salida:"),
+                Select([("PDF estándar",                              "pdf"),
+                        ("PDF/A-2b — archival",                      "pdf_a"),
+                        ("Comprimido (WebP→JPEG) — ~50% más pequeño","compressed")],
+                       value="pdf", id="pdf-format"),
+
+                Label("Workers (páginas en paralelo):"),
+                Select([("1 — secuencial",  "1"),
+                        ("3 — recomendado", "3"),
+                        ("5 — rápido",      "5"),
+                        ("10 — agresivo",   "10")],
+                       value="3", id="pdf-workers"),
+
+                Label("Prompt OCR:"),
+                TextArea(DEFAULT_VISION_PROMPT, id="pdf-prompt", language=None),
+                Button("↺ Restaurar prompt", variant="default", id="pdf-btn-reset-prompt"),
+
+                title="⚙️  Opciones avanzadas",
+                collapsed=True,
+            ),
+
+            Button("▶  Iniciar", variant="primary", id="pdf-btn-start"),
+            Button("⬅  Volver",  variant="default", id="pdf-btn-back"),
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        cfg = _load_tui_config()
+        if cfg.get("api_key"):
+            self.query_one("#pdf-api-key", Input).value = cfg["api_key"]
+        if cfg.get("base_url"):
+            self.query_one("#pdf-base-url", Input).value = cfg["base_url"]
+        if cfg.get("ocr_prompt"):
+            self.query_one("#pdf-prompt", TextArea).load_text(cfg["ocr_prompt"])
+        engine = cfg.get("engine", "openrouter")
+        self.query_one("#pdf-engine", Select).value = engine
+        self._update_model(engine, cfg.get("model") or None)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "pdf-engine":
+            self._update_model(str(event.value))
+
+    def _update_model(self, engine: str, saved: Optional[str] = None) -> None:
+        sel    = self.query_one("#pdf-model", Select)
+        models = ENGINE_MODELS.get(engine, [])
+        if engine == "tesseract":
+            sel.set_options([("(no aplica)", Select.BLANK)]); sel.value = Select.BLANK; sel.disabled = True; return
+        if engine == "ollama":
+            sel.set_options([("⏳ detectando…", Select.BLANK)]); sel.value = Select.BLANK; sel.disabled = True
+            threading.Thread(target=self._fetch_ollama, daemon=True).start(); return
+        sel.set_options(models); sel.disabled = False
+        vals = [v for _, v in models]
+        default = saved or ENGINE_DEFAULTS.get(engine, {}).get("model", "")
+        sel.value = default if default in vals else (vals[0] if vals else Select.BLANK)
+
+    def _fetch_ollama(self) -> None:
+        import urllib.request
+        base = self.query_one("#pdf-base-url", Input).value.strip() or "http://localhost:11434"
+        try:
+            with urllib.request.urlopen(f"{base.replace('/v1','')}/api/tags", timeout=3) as r:
+                data = json.loads(r.read())
+            opts = [(m["name"], m["name"]) for m in data.get("models", [])] or [("(ninguno)", Select.BLANK)]
+        except Exception:
+            opts = [("(Ollama no disponible)", Select.BLANK)]
+        def apply():
+            sel = self.query_one("#pdf-model", Select)
+            sel.set_options(opts); sel.disabled = (opts[0][1] == Select.BLANK)
+            if not sel.disabled: sel.value = opts[0][1]
+        self.app.call_from_thread(apply)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "pdf-btn-back":
+            self.app.pop_screen()
+        elif bid == "pdf-btn-reset-prompt":
+            self.query_one("#pdf-prompt", TextArea).load_text(DEFAULT_VISION_PROMPT)
+        elif bid == "pdf-btn-test":
+            self._run_test()
+        elif bid == "pdf-btn-start":
+            self._start()
+
+    def _run_test(self) -> None:
+        engine  = str(self.query_one("#pdf-engine", Select).value)
+        mv      = self.query_one("#pdf-model", Select).value
+        model   = self.query_one("#pdf-model-custom", Input).value.strip() or (None if mv == Select.BLANK else str(mv))
+        api_key = self.query_one("#pdf-api-key", Input).value.strip() or None
+        base_url= self.query_one("#pdf-base-url", Input).value.strip() or None
+        res_w   = self.query_one("#pdf-test-result", Static)
+        btn     = self.query_one("#pdf-btn-test", Button)
+        res_w.update("[yellow]⏳ Probando…[/yellow]"); btn.disabled = True
+        def _t():
+            ok, msg = test_backend(engine, model=model, api_key=api_key, base_url=base_url)
+            self.app.call_from_thread(lambda: (res_w.update(f"{'[green]✔[/green]' if ok else '[red]✗[/red]'} {msg}"), setattr(btn, 'disabled', False)))
+        threading.Thread(target=_t, daemon=True).start()
+
+    def _start(self) -> None:
+        raw = self.query_one("#pdf-input", Input).value.strip()
+        import re as _re
+        raw = _re.sub(r'\\(.)', r'\1', raw)
+        in_path = Path(raw).resolve()
+        if not in_path.exists():
+            self.app.push_screen(ErrorScreen(f"No existe: {in_path}")); return
+
+        out_val = self.query_one("#pdf-output", Input).value.strip() or "PDFs_OCR"
+        out_dir = (in_path.parent / out_val) if not Path(out_val).is_absolute() else Path(out_val)
+
+        engine   = str(self.query_one("#pdf-engine", Select).value)
+        mv       = self.query_one("#pdf-model", Select).value
+        model    = self.query_one("#pdf-model-custom", Input).value.strip() or (None if mv == Select.BLANK else str(mv))
+        api_key  = self.query_one("#pdf-api-key", Input).value.strip() or None
+        base_url = self.query_one("#pdf-base-url", Input).value.strip() or None
+        fmt      = str(self.query_one("#pdf-format", Select).value)
+        workers  = int(str(self.query_one("#pdf-workers", Select).value))
+        prompt   = self.query_one("#pdf-prompt", TextArea).text.strip() or None
+
+        # Normalizar: si es un PDF único, usar su directorio como input_dir
+        if in_path.is_file() and in_path.suffix.lower() == ".pdf":
+            glob_pat = in_path.name
+            scan_dir = in_path.parent
+        else:
+            glob_pat = "*.pdf"
+            scan_dir = in_path
+
+        self.app.push_screen(PdfOcrProcessScreen(
+            scan_dir, out_dir, glob_pat,
+            engine=engine, model=model, api_key=api_key, base_url=base_url,
+            pdf_format=fmt, workers=workers, ocr_prompt=prompt,
+        ))
+
+
+class PdfOcrProcessScreen(Screen):
+    """Pantalla de progreso para PDF → PDF+OCR."""
+
+    def __init__(self, input_dir: Path, output_dir: Path, glob: str = "*.pdf",
+                 engine: str = "openrouter", model: Optional[str] = None,
+                 api_key: Optional[str] = None, base_url: Optional[str] = None,
+                 pdf_format: str = "pdf", workers: int = 3,
+                 ocr_prompt: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self._input_dir  = input_dir
+        self._output_dir = output_dir
+        self._glob       = glob
+        self._engine     = engine
+        self._model      = model
+        self._api_key    = api_key
+        self._base_url   = base_url
+        self._pdf_format = pdf_format
+        self._workers    = workers
+        self._ocr_prompt = ocr_prompt
+        self._eq: queue.Queue = queue.Queue()
+        self._cancel = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Container(
+            Static(id="pdf-proc-title", classes="section-title"),
+            Horizontal(
+                Static("General: ", id="global-label"),
+                ProgressBar(id="global-progress", show_eta=True),
+            ),
+            Rule(),
+            RichLog(id="log-view", highlight=True, markup=True, max_lines=200),
+            Button("⬅ Volver al menú", variant="error", id="btn-cancel"),
+            id="process-container",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        pdfs = sorted(self._input_dir.glob(self._glob))
+        n    = len(pdfs)
+        fmt_label = {"pdf": "PDF", "pdf_a": "PDF/A", "compressed": "Comprimido"}.get(self._pdf_format, "PDF")
+        self.query_one("#pdf-proc-title", Static).update(
+            f"[bold]📄 {self._input_dir.name}[/bold]  ·  {n} PDFs  ·  {self._engine}  ·  {fmt_label}")
+        self.query_one("#global-progress", ProgressBar).update(total=max(n, 1), progress=0)
+        self.query_one("#log-view", RichLog).write("[green]▶ Iniciando…[/green]")
+
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+        self._consumer_running = True
+        threading.Thread(target=self._consume, daemon=True).start()
+        self.set_interval(0.25, self._check)
+
+    def _run(self) -> None:
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        ocr_pdf_dir(
+            self._input_dir, self._output_dir, glob=self._glob,
+            engine=self._engine, model=self._model,
+            api_key=self._api_key, base_url=self._base_url,
+            ocr_prompt=self._ocr_prompt, pdf_format=self._pdf_format,
+            workers=self._workers, target_dpi=250,
+            event_queue=self._eq, cancel_event=self._cancel,
+        )
+
+    def _consume(self) -> None:
+        while getattr(self, '_consumer_running', True):
+            try:
+                ev = self._eq.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            self.app.call_from_thread(self._handle, ev)
+
+    def _handle(self, ev) -> None:
+        try:
+            d   = ev.to_dict()
+            log = self.query_one("#log-view", RichLog)
+            gpb = self.query_one("#global-progress", ProgressBar)
+            if ev.kind == ProgressEvent.BOOK_START:
+                log.write(f"\n[cyan]📄 {d.get('book','')}[/cyan]")
+            elif ev.kind == ProgressEvent.PAGE_OK:
+                log.write(f"   ✓ {d.get('file','')}")
+            elif ev.kind == ProgressEvent.PAGE_FAIL:
+                log.write(f"[yellow]   ⚠ {d.get('file','')} (fallo)[/yellow]")
+            elif ev.kind == ProgressEvent.MERGE_START:
+                log.write(f"[cyan]   ⎇ Reconstruyendo PDF…[/cyan]")
+            elif ev.kind == ProgressEvent.VERIFY_OK:
+                log.write(f"[green]   ✔ {d.get('message','')}[/green]")
+            elif ev.kind == ProgressEvent.VERIFY_FAIL:
+                log.write(f"[red]   ✗ {d.get('message','')}[/red]")
+            elif ev.kind == ProgressEvent.BOOK_DONE:
+                gpb.advance(1)
+                log.write(f"[green]   ✓ {d.get('book','')} — {d.get('size_mb',0)} MB[/green]")
+            elif ev.kind == ProgressEvent.BOOK_FAIL:
+                gpb.advance(1)
+                log.write(f"[red]   ✗ {d.get('book','')} — fallo[/red]")
+            elif ev.kind == ProgressEvent.ALL_DONE:
+                r = d.get("result", {})
+                log.write(f"\n[bold green]🎉 Completado — {r.get('ok',0)}/{r.get('total',0)} PDFs con OCR[/bold green]")
+                self.query_one("#btn-cancel", Button).label = "⬅ Volver"
+        except Exception:
+            pass
+
+    def _check(self) -> None:
+        if self._worker and not self._worker.is_alive():
+            self._consumer_running = False
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self._cancel.set()
+        self._consumer_running = False
+        self.app.pop_screen()
 
 
 # ── Pantalla de estado ──────────────────────────────────────────────────────────
